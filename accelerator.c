@@ -1,10 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define B 1 // Batch size
 #define C 3 // Input image channel dimensions (RGB)
 #define H 192 // Image height
-#define W 640 // Image width 
+#define W 320 // Image width 
 
 // Function prototypes
 void image_reconstruction(float Is[B][C][H][W], float Dt[B][1][H][W], float T[B][4][4], float K[B][3][3], float It[B][C][H][W]);
@@ -47,9 +48,9 @@ void write_ppm(const char *filename, float image[B][C][H][W]) {
     for (int i = 0; i < H; i++) {
         for (int j = 0; j < W; j++) {
             // Since we're using B = 1, we access image[0]
-            int r = (int)(image[0][0][i][j] * 255.0f);
-            int g = (int)(image[0][1][i][j] * 255.0f);
-            int b = (int)(image[0][2][i][j] * 255.0f);
+            int r = (int)(image[0][0][i][j]);
+            int g = (int)(image[0][1][i][j]);
+            int b = (int)(image[0][2][i][j]);
 
             // Clamp values between 0 and 255
             if (r < 0) r = 0; if (r > 255) r = 255;
@@ -72,33 +73,27 @@ void image_reconstruction(float Is[B][C][H][W], float Dt[B][1][H][W], float T[B]
     float K_inv[B][3][3];
     float cam_coords[B][4][H * W];
     float src_coords[B][3][H * W]; 
-    int i, j, b, k, x, y, c, x_min, y_min; 
-    float sum;
-    float w_bi[B][4][H][W];
-    float kernel[2][2];
+    int i, j, b, k, c; 
 
-
-    // build the tensor of sampling coordinates p_s ~K*T*D*K^(-1)*p_t
-
-    // compute camera intrinsic matrix inverse
-    // create the p_t tensor (each column holds homogenous coordinate -> x,y,1) 
-    // flatten Dt into Dt_flat
+    // Build the tensor of sampling coordinates p_s ~ K*T*D*K^(-1)*p_t
     for(b = 0; b < B; b++){
         inverse(K, K_inv, b);
+
+        // Initialize p_t and Dt_flat
         for(j = 0; j < H * W; j++){
-            x = j / W; 
-            y = j % W;
-            p_t[b][0][j] = x; 
-            p_t[b][1][j] = y;
+            int y = j / W; // Row index
+            int x = j % W; // Column index
+            p_t[b][0][j] = x; // x-coordinate
+            p_t[b][1][j] = y; // y-coordinate
             p_t[b][2][j] = 1.0f;
-            Dt_flat[b][0][j] = Dt[b][0][x][y];
-            cam_coords[b][3][j] = 1.0f; // set up initially homogenous camera coordinate tensor
+            Dt_flat[b][0][j] = Dt[b][0][y][x];
+            cam_coords[b][3][j] = 1.0f; // Homogeneous coordinate
         }
 
-        // compute Dt * K^(-1) * p_t
+        // Compute cam_coords = Dt * K_inv * p_t
         for(i = 0; i < 3; i++){
             for (j = 0; j < H * W; j++){
-                sum = 0.0f;
+                float sum = 0.0f;
                 for (k = 0; k < 3; k++){
                     sum += K_inv[b][i][k] * p_t[b][k][j];
                 }
@@ -106,21 +101,26 @@ void image_reconstruction(float Is[B][C][H][W], float Dt[B][1][H][W], float T[B]
             }
         }
 
-        //compute T * Dt * K^(-1) * p_t ==> we only want the first 3 rows of the output, so we only compute using the first 3 rows of T
-        for(i = 0; i < 3; i++){
-            for (j = 0; j < H * W; j++){
-                sum = 0.0f;
+        // Compute src_coords = T * cam_coords
+        for(j = 0; j < H * W; j++){
+            float cam_coord[4];
+            for (i = 0; i < 4; i++) {
+                cam_coord[i] = cam_coords[b][i][j];
+            }
+
+            for(i = 0; i < 3; i++){
+                float sum = 0.0f;
                 for (k = 0; k < 4; k++){
-                    sum += T[b][i][k] * cam_coords[b][k][j];
+                    sum += T[b][i][k] * cam_coord[k];
                 }
                 src_coords[b][i][j] = sum;
             }
         }
 
-        //compute ps = K*T*D*K^(-1)*p_t
+        // Compute p_s_flat = K * src_coords
         for(i = 0; i < 3; i++){
             for (j = 0; j < H * W; j++){
-                sum = 0.0f;
+                float sum = 0.0f;
                 for (k = 0; k < 3; k++){
                     sum += K[b][i][k] * src_coords[b][k][j];
                 }
@@ -128,53 +128,52 @@ void image_reconstruction(float Is[B][C][H][W], float Dt[B][1][H][W], float T[B]
             }
         }
 
-        // normalize ps_flat to homogenous coordinates and stack into 2 channel tensor
-        for (j = 0; j < H * W; j++){
-            x = j / W; 
-            y = j % W;
-            p_s[b][0][x][y] = p_s_flat[b][0][j] / p_s_flat[b][2][j];
-            p_s[b][1][x][y] = p_s_flat[b][1][j] / p_s_flat[b][2][j];
+        // Normalize to get pixel coordinates
+        for(j = 0; j < H * W; j++){
+            int y = j / W;
+            int x = j % W;
+            float x_s = p_s_flat[b][0][j] / p_s_flat[b][2][j];
+            float y_s = p_s_flat[b][1][j] / p_s_flat[b][2][j];
+
+            p_s[b][0][y][x] = x_s; // x-coordinate
+            p_s[b][1][y][x] = y_s; // y-coordinate
         }
 
-        // Perform Bilinear Sampling using Is, p_s, and putting the result in It
-
-        /*Step 1. take the x and y coordinates for the sampling location into two separate matrices
-            Step 2. Find the floor, and the floor + 1 for each of the x and y coords, store then in x/y min/max matrices
-            step 3. Compute weighted value matrices for bilinear sampling
-            Step 4. Perform sampling by aligning 2x2 kernel with weighted values at x_min, y_min location and performing depth-wise 
-                    sep conv with Is
-            Step 5. Store final value for each channel at pixel coordinate holding sampling corrdinate in It. 
-        */
+        // Perform bilinear sampling
         for(i = 0; i < H; i++){
             for(j = 0; j < W; j++){
-                w_bi[b][0][i][j] = (p_s[b][0][i][j] - (int)p_s[b][0][i][j]) * (p_s[b][1][i][j] - (int)p_s[b][1][i][j]) ; // W00 = (x - floor(x))*(y - floor(y))
-                w_bi[b][1][i][j] = (p_s[b][0][i][j] - (int)p_s[b][0][i][j]) * ((int)p_s[b][1][i][j] + 1 - p_s[b][1][i][j]) ; // W01 = (x - floor(x))*(floor(y) + 1 - y)
-                w_bi[b][2][i][j] = ((int)p_s[b][0][i][j] + 1 - p_s[b][0][i][j]) * (p_s[b][1][i][j] - (int)p_s[b][1][i][j]) ; // W10 = (floor(x) + 1 - x)*(y - floor(y))
-                w_bi[b][3][i][j] = ((int)p_s[b][0][i][j] + 1 - p_s[b][0][i][j]) * ((int)p_s[b][1][i][j] + 1 - p_s[b][1][i][j]) ; // W11 = (floor(x) + 1 - x)*(floor(y) + 1 - y)
-            }
-        }
+                float x_s = p_s[b][0][i][j];
+                float y_s = p_s[b][1][i][j];
 
-        // perform bilinear sampling 
-        for(i = 0; i < H; i++){
-            for(j = 0; j < W; j++){
-                // populate kernel
-                kernel[0][0] = w_bi[b][0][i][j];
-                kernel[0][1] = w_bi[b][1][i][j];
-                kernel[1][0] = w_bi[b][2][i][j];
-                kernel[1][1] = w_bi[b][3][i][j];
-                // get sample x, y using xmin, ymin
-                x_min = (int)p_s[b][0][i][j];
-                y_min = (int)p_s[b][1][i][j];
+                int x0 = (int)(x_s);
+                int x1 = x0 + 1;
+                int y0 = (int)(y_s);
+                int y1 = y0 + 1;
 
-                for(c = 0; c < 3; c++){                    
-                    sum = 0;
-                    // perform multiplications
-                    for(x = 0; x < 2; x++){
-                        for(y = 0; y < 2; y++){
-                            sum += Is[b][c][x_min + x][y_min + y] * kernel[x][y];
-                        }
-                    }
-                    It[b][c][i][j] = sum;                
+                float x_frac = x_s - x0;
+                float y_frac = y_s - y0;
+
+                float w00 = (1 - x_frac) * (1 - y_frac); // Top-left
+                float w01 = (1 - x_frac) * y_frac;       // Bottom-left
+                float w10 = x_frac * (1 - y_frac);       // Top-right
+                float w11 = x_frac * y_frac;             // Bottom-right
+
+                for (c = 0; c < C; c++) {
+                    float sum = 0.0f;
+
+                    if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H)
+                        sum += Is[b][c][y0][x0] * w00;
+
+                    if (x0 >= 0 && x0 < W && y1 >= 0 && y1 < H)
+                        sum += Is[b][c][y1][x0] * w01;
+
+                    if (x1 >= 0 && x1 < W && y0 >= 0 && y0 < H)
+                        sum += Is[b][c][y0][x1] * w10;
+
+                    if (x1 >= 0 && x1 < W && y1 >= 0 && y1 < H)
+                        sum += Is[b][c][y1][x1] * w11;
+
+                    It[b][c][i][j] = sum;
                 }
             }
         }
@@ -194,22 +193,59 @@ int main() {
 
     // Initialize Is (source image) with a gradient pattern
     for (b = 0; b < B; b++) {
-        for (i = 0; i < H; i++) {
-            for (j = 0; j < W; j++) {
-                // Simple gradient pattern
-                Is[b][0][i][j] = (float)j / (W - 1);       // Red channel
-                Is[b][1][i][j] = (float)i / (H - 1);       // Green channel
-                Is[b][2][i][j] = 0.5f;                     // Blue channel fixed at 0.5
+        for (int i = 0; i < H; i++) {
+            for (int j = 0; j < W; j++) {
+                Is[b][0][i][j] = 135;  // Red channel
+                Is[b][1][i][j] = 206;  // Green channel
+                Is[b][2][i][j] = 235;  // Blue channel
+            }
+        }
+
+            // Draw a simple house
+        int house_start_x = 80;
+        int house_start_y = 120;
+        int house_width = 100;
+        int house_height = 80;
+
+        for (int i = house_start_y; i < house_start_y + house_height; i++) {
+            for (int j = house_start_x; j < house_start_x + house_width; j++) {
+                Is[b][0][i][j] = 139;  // Red channel (brown)
+                Is[b][1][i][j] = 69;   // Green channel
+                Is[b][2][i][j] = 19;   // Blue channel
+            }
+        }
+
+        // Draw the roof (red triangle)
+        for (int i = 0; i < 40; i++) {
+            for (int j = house_start_x - i; j <= house_start_x + house_width + i; j++) {
+                if (j >= house_start_x && j <= house_start_x + house_width) {
+                    Is[b][0][house_start_y - i][j] = 165;  // Red channel
+                    Is[b][1][house_start_y - i][j] = 42;   // Green channel
+                    Is[b][2][house_start_y - i][j] = 42;   // Blue channel
+                }
+            }
+        }
+
+        // Draw the door (simple rectangle)
+        int door_start_x = house_start_x + house_width / 2 - 10;
+        int door_start_y = house_start_y + house_height - 30;
+        int door_width = 20;
+        int door_height = 30;
+
+        for (int i = door_start_y; i < door_start_y + door_height; i++) {
+            for (int j = door_start_x; j < door_start_x + door_width; j++) {
+                Is[b][0][i][j] = 101;  // Red channel (dark brown)
+                Is[b][1][i][j] = 67;   // Green channel
+                Is[b][2][i][j] = 33;   // Blue channel
             }
         }
     }
-
     // Initialize Dt (depth map) with a constant depth value
     for (b = 0; b < B; b++) {
         for (i = 0; i < H; i++) {
             for (j = 0; j < W; j++) {
                 Dt[b][0][i][j] = 1.0f; // Depth of 1.0 units
-            }
+            }   
         }
     }
 
@@ -233,8 +269,14 @@ int main() {
                 T_t2s[b][i][j] = (i == j) ? 1.0f : 0.0f;
 
         // Apply a small translation
-        T_t2s[b][0][3] = 0.1f; // Translate 0.1 units along x-axis
+        T_t2s[b][0][0] = 0.5*cos(90); 
+        T_t2s[b][0][1] = -1.1*sin(90);
+        T_t2s[b][1][0] = 0.5*sin(90); 
+        T_t2s[b][1][1] = -1.1*cos(90);
+        T_t2s[b][0][3] = 0.02f; 
+        T_t2s[b][1][3] = -0.03f; // Translate 0.1 units along x-axis
         // You can also add rotation by modifying the top-left 3x3 submatrix
+    
     }
 
     // Call the reconstruct_image function
